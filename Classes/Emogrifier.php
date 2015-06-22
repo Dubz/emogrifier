@@ -6,6 +6,8 @@ namespace Pelago;
  *
  * For more information, please see the README.md file.
  *
+ * @version 0.1.1
+ *
  * @author Cameron Brooks
  * @author Jaime Prado
  * @author Roman Ožana <ozana@omdesign.cz>
@@ -102,20 +104,32 @@ class Emogrifier
     private $styleAttributesForNodes = array();
 
     /**
-     * This attribute applies to the case where you want to preserve your original text encoding.
-     *
-     * By default, emogrifier translates your text into HTML entities for two reasons:
-     *
-     * 1. Because of client incompatibilities, it is better practice to send out HTML entities
-     *    rather than unicode over email.
-     *
-     * 2. It translates any illegal XML characters that DOMDocument cannot work with.
-     *
-     * If you would like to preserve your original encoding, set this attribute to true.
+     * Determines whether the "style" attributes of tags in the the HTML passed to this class should be preserved.
+     * If set to false, the value of the style attributes will be discarded.
      *
      * @var bool
      */
-    public $preserveEncoding = false;
+    private $isInlineStyleAttributesParsingEnabled = true;
+
+    /**
+     * Determines whether the <style> blocks in the HTML passed to this class should be parsed.
+     *
+     * If set to true, the <style> blocks will be removed from the HTML and their contents will be applied to the HTML
+     * via inline styles.
+     *
+     * If set to false, the <style> blocks will be left as they are in the HTML.
+     *
+     * @var bool
+     */
+    private $isStyleBlocksParsingEnabled = true;
+
+    /**
+     * Determines whether elements with the `display: none` property are
+     * removed from the DOM.
+     *
+     * @var bool
+     */
+    private $shouldKeepInvisibleNodes = true;
 
     /**
      * The constructor.
@@ -190,25 +204,11 @@ class Emogrifier
         if ($nodesWithStyleAttributes !== false) {
             /** @var \DOMElement $node */
             foreach ($nodesWithStyleAttributes as $node) {
-                $normalizedOriginalStyle = preg_replace_callback(
-                    '/[A-z\\-]+(?=\\:)/S',
-                    function (array $m) {
-                        return strtolower($m[0]);
-                    },
-                    $node->getAttribute('style')
-                );
-
-                // in order to not overwrite existing style attributes in the HTML, we have to save
-                // the original HTML styles
-                $nodePath = $node->getNodePath();
-                if (!isset($this->styleAttributesForNodes[$nodePath])) {
-                    $this->styleAttributesForNodes[$nodePath] = $this->parseCssDeclarationBlock(
-                        $normalizedOriginalStyle
-                    );
-                    $this->visitedNodes[$nodePath] = $node;
+                if ($this->isInlineStyleAttributesParsingEnabled) {
+                    $this->normalizeStyleAttributes($node);
+                } else {
+                    $node->removeAttribute('style');
                 }
-
-                $node->setAttribute('style', $normalizedOriginalStyle);
             }
         }
 
@@ -216,7 +216,9 @@ class Emogrifier
         // (these blocks should be appended so as to have precedence over conflicting styles in the existing CSS)
         $allCss = $this->css;
 
-        $allCss .= $this->getCssFromAllStyleNodes($xpath);
+        if ($this->isStyleBlocksParsingEnabled) {
+            $allCss .= $this->getCssFromAllStyleNodes($xpath);
+        }
 
         $cssParts = $this->splitCssAndMediaQuery($allCss);
 
@@ -237,8 +239,7 @@ class Emogrifier
                 foreach ($selectors as $selector) {
                     // don't process pseudo-elements and behavioral (dynamic) pseudo-classes;
                     // only allow structural pseudo-classes
-                    if (
-                        strpos($selector, ':') !== false && !preg_match('/:\\S+\\-(child|type)\\(/i', $selector)
+                    if (strpos($selector, ':') !== false && !preg_match('/:\\S+\\-(child|type)\\(/i', $selector)
                     ) {
                         continue;
                     }
@@ -278,42 +279,47 @@ class Emogrifier
             }
         }
 
-        // now iterate through the nodes that contained inline styles in the original HTML
-        foreach ($this->styleAttributesForNodes as $nodePath => $styleAttributesForNode) {
-            $node = $this->visitedNodes[$nodePath];
-            $currentStyleAttributes = $this->parseCssDeclarationBlock($node->getAttribute('style'));
-            $node->setAttribute(
-                'style',
-                $this->generateStyleStringFromDeclarationsArrays($currentStyleAttributes, $styleAttributesForNode)
-            );
+        if ($this->isInlineStyleAttributesParsingEnabled) {
+            $this->fillStyleAttributesWithMergedStyles();
         }
 
-        // This removes styles from your email that contain display:none.
-        // We need to look for display:none, but we need to do a case-insensitive search. Since DOMDocument only
-        // supports XPath 1.0, lower-case() isn't available to us. We've thus far only set attributes to lowercase,
-        // not attribute values. Consequently, we need to translate() the letters that would be in 'NONE' ("NOE")
-        // to lowercase.
-        $nodesWithStyleDisplayNone = $xpath->query(
-            '//*[contains(translate(translate(@style," ",""),"NOE","noe"),"display:none")]'
-        );
-        // The checks on parentNode and is_callable below ensure that if we've deleted the parent node,
-        // we don't try to call removeChild on a nonexistent child node
-        if ($nodesWithStyleDisplayNone->length > 0) {
-            /** @var \DOMNode $node */
-            foreach ($nodesWithStyleDisplayNone as $node) {
-                if ($node->parentNode && is_callable(array($node->parentNode,'removeChild'))) {
-                    $node->parentNode->removeChild($node);
-                }
-            }
+        if ($this->shouldKeepInvisibleNodes) {
+            $this->removeInvisibleNodes($xpath);
         }
 
         $this->copyCssWithMediaToStyleNode($cssParts, $xmlDocument);
 
-        if ($this->preserveEncoding) {
-            return mb_convert_encoding($xmlDocument->saveHTML(), self::ENCODING, 'HTML-ENTITIES');
-        } else {
-            return $xmlDocument->saveHTML();
-        }
+        return mb_convert_encoding($xmlDocument->saveHTML(), self::ENCODING, 'HTML-ENTITIES');
+    }
+
+    /**
+     * Disables the parsing of inline styles.
+     *
+     * @return void
+     */
+    public function disableInlineStyleAttributesParsing()
+    {
+        $this->isInlineStyleAttributesParsingEnabled = false;
+    }
+
+    /**
+     * Disables the parsing of <style> blocks.
+     *
+     * @return void
+     */
+    public function disableStyleBlocksParsing()
+    {
+        $this->isStyleBlocksParsingEnabled = false;
+    }
+
+    /**
+     * Disables the removal of elements with `display: none` properties.
+     *
+     * @return void
+     */
+    public function disableInvisibleNodeRemoval()
+    {
+        $this->shouldKeepInvisibleNodes = false;
     }
 
     /**
@@ -394,6 +400,84 @@ class Emogrifier
         $key = array_search($tagName, $this->unprocessableHtmlTags, true);
         if ($key !== false) {
             unset($this->unprocessableHtmlTags[$key]);
+        }
+    }
+
+     /**
+      * This removes styles from your email that contain display:none.
+      * We need to look for display:none, but we need to do a case-insensitive search. Since DOMDocument only
+      * supports XPath 1.0, lower-case() isn't available to us. We've thus far only set attributes to lowercase,
+      * not attribute values. Consequently, we need to translate() the letters that would be in 'NONE' ("NOE")
+      * to lowercase.
+      *
+      * @param \DOMXPath $xpath
+      *
+      * @return void
+      */
+    private function removeInvisibleNodes(\DOMXPath $xpath)
+    {
+        $nodesWithStyleDisplayNone = $xpath->query(
+            '//*[contains(translate(translate(@style," ",""),"NOE","noe"),"display:none")]'
+        );
+        if ($nodesWithStyleDisplayNone->length === 0) {
+            return;
+        }
+
+        // The checks on parentNode and is_callable below ensure that if we've deleted the parent node,
+        // we don't try to call removeChild on a nonexistent child node
+        /** @var \DOMNode $node */
+        foreach ($nodesWithStyleDisplayNone as $node) {
+            if ($node->parentNode && is_callable(array($node->parentNode, 'removeChild'))) {
+                $node->parentNode->removeChild($node);
+            }
+        }
+    }
+
+    /**
+     * Normalizes the value of the "style" attribute and saves it.
+     *
+     * @param \DOMElement $node
+     *
+     * @return void
+     */
+    private function normalizeStyleAttributes(\DOMElement $node)
+    {
+        $normalizedOriginalStyle = preg_replace_callback(
+            '/[A-z\\-]+(?=\\:)/S',
+            function (array $m) {
+                return strtolower($m[0]);
+            },
+            $node->getAttribute('style')
+        );
+
+        // in order to not overwrite existing style attributes in the HTML, we
+        // have to save the original HTML styles
+        $nodePath = $node->getNodePath();
+        if (!isset($this->styleAttributesForNodes[$nodePath])) {
+            $this->styleAttributesForNodes[$nodePath] = $this->parseCssDeclarationBlock($normalizedOriginalStyle);
+            $this->visitedNodes[$nodePath] = $node;
+        }
+
+        $node->setAttribute('style', $normalizedOriginalStyle);
+    }
+
+    /**
+     * Merges styles from styles attributes and style nodes and applies them to the attribute nodes
+     *
+     * return @void
+     */
+    private function fillStyleAttributesWithMergedStyles()
+    {
+        foreach ($this->styleAttributesForNodes as $nodePath => $styleAttributesForNode) {
+            $node = $this->visitedNodes[$nodePath];
+            $currentStyleAttributes = $this->parseCssDeclarationBlock($node->getAttribute('style'));
+            $node->setAttribute(
+                'style',
+                $this->generateStyleStringFromDeclarationsArrays(
+                    $currentStyleAttributes,
+                    $styleAttributesForNode
+                )
+            );
         }
     }
 
@@ -529,7 +613,7 @@ class Emogrifier
 
         $css = preg_replace_callback(
             '#@media\\s+(?:only\\s)?(?:[\\s{\\(]|screen|all)\\s?[^{]+{.*}\\s*}\\s*#misU',
-            function($matches) use (&$media) {
+            function ($matches) use (&$media) {
                 $media .= $matches[0];
             },
             $css
@@ -662,7 +746,7 @@ class Emogrifier
         $cssSelector = ' ' . $paramCssSelector . ' ';
         $cssSelector = preg_replace_callback(
             '/\\s+\\w+\\s+/',
-            function(array $matches) {
+            function (array $matches) {
                 return strtolower($matches[0]);
             },
             $cssSelector
